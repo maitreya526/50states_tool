@@ -1,211 +1,115 @@
 import pandas as pd
 import json
-import re
+import unicodedata
 
 INPUT_PATH = "data/raw/all_laws.csv"
 OUTPUT_PATH = "data/processed/state_laws.json"
 
 
 # -----------------------------
-# TEXT NORMALIZATION
+# CLEAN TEXT (fix encoding issues)
 # -----------------------------
-def normalize_text(text):
+def clean_text(text):
     if pd.isna(text):
         return ""
 
     text = str(text)
-    text = text.replace("\n", " ").replace("\r", " ")
-    text = re.sub(r"\s+", " ", text)
 
-    # fix numbers like 1,000 → 1000
-    text = re.sub(r"(\d),(\d)", r"\1\2", text)
+    # normalize unicode (fix broken encodings)
+    text = unicodedata.normalize("NFKD", text)
 
-    return text.lower()
+    # fix common bad sequences
+    replacements = {
+        "\u00e2\u20ac\u00a2": "•",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"'
+    }
+
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+
+    # remove non-ascii (optional but safe here)
+    text = text.encode("ascii", "ignore").decode("ascii")
+
+    return text.strip()
 
 
 # -----------------------------
-# PII BUCKET
+# CLEAN INT
 # -----------------------------
-def pii_bucket(x):
+def clean_int(value):
+    if pd.isna(value):
+        return None
+
     try:
-        x = int(x)
+        return int(value)
     except:
-        return "unknown"
-
-    if x <= 3:
-        return "narrow"
-    elif x <= 7:
-        return "medium"
-    else:
-        return "broad"
+        return None
 
 
 # -----------------------------
 # TIMELINE
 # -----------------------------
-def parse_timeline(val):
-    if pd.isna(val):
+def clean_timeline(value):
+    if pd.isna(value):
+        return {"type": "flexible", "days": None}
+
+    text = str(value).strip().lower()
+
+    if "not specified" in text or text == "":
         return {"type": "flexible", "days": None}
 
     try:
-        return {"type": "fixed", "days": int(val)}
+        return {"type": "fixed", "days": int(text)}
     except:
         return {"type": "flexible", "days": None}
-
-
-# -----------------------------
-# THRESHOLD
-# -----------------------------
-def extract_threshold(text):
-    text = normalize_text(text)
-
-    # conditional patterns
-    match = re.search(
-        r"(more than|over|greater than|exceeding|at least|if)\s+\D*?(\d{2,6})\s*(residents|individuals|persons|consumers)",
-        text
-    )
-    if match:
-        return int(match.group(2))
-
-    # fallback
-    match2 = re.search(
-        r"(\d{2,6})\s*(residents|individuals|persons|consumers)",
-        text
-    )
-    if match2:
-        return int(match2.group(1))
-
-    return None
-
-
-# -----------------------------
-# DEADLINE
-# -----------------------------
-def extract_deadline(text):
-    text = normalize_text(text)
-
-    # days
-    match_days = re.search(r"(within|no later than)\s+(\d+)\s*day", text)
-    if match_days:
-        return int(match_days.group(2)), "days"
-
-    # hours
-    match_hours = re.search(r"(within|no later than)\s+(\d+)\s*hour", text)
-    if match_hours:
-        return int(match_hours.group(2)), "hours"
-
-    return None, None
-
-
-# -----------------------------
-# AG PARSER (CORE + META)
-# -----------------------------
-def parse_ag(text):
-    raw = normalize_text(text)
-
-    if raw == "":
-        return {
-            "type": "none",
-            "threshold": None,
-            "deadline_days": None,
-            "deadline_hours": None,
-            "meta": {},
-            "raw_text": ""
-        }
-
-    threshold = extract_threshold(raw)
-    deadline_value, unit = extract_deadline(raw)
-
-    deadline_days = None
-    deadline_hours = None
-
-    if unit == "days":
-        deadline_days = deadline_value
-    elif unit == "hours":
-        deadline_hours = deadline_value
-
-    # determine type (fixed bug: no "no" substring issue)
-    if re.search(r"\bno\s+notification\b|\bnot\s+required\b", raw):
-        ag_type = "none"
-    elif threshold is not None:
-        ag_type = "conditional"
-    elif re.search(r"\bmust notify\b|\bshall notify\b", raw):
-        ag_type = "mandatory"
-    else:
-        ag_type = "unknown"
-
-    # CLEAN invalid threshold
-    if threshold is not None and threshold < 50:
-        threshold = None
-
-    # META extraction (very light, no overengineering)
-    conditions = []
-    if "after determination" in raw:
-        conditions.append("after_determination")
-    if "same time" in raw:
-        conditions.append("simultaneous_with_consumer")
-
-    return {
-        "type": ag_type,
-        "threshold": threshold,
-        "deadline_days": deadline_days,
-        "deadline_hours": deadline_hours,
-        "meta": {
-            "conditions": conditions
-        },
-        "raw_text": raw
-    }
-
-
-# -----------------------------
-# PENALTY
-# -----------------------------
-def parse_penalty(text):
-    raw = normalize_text(text)
-
-    if raw == "":
-        return {
-            "type": "unknown",
-            "raw_text": ""
-        }
-
-    if "per" in raw and "record" in raw:
-        p_type = "per_record"
-    elif "cap" in raw or "max" in raw:
-        p_type = "capped"
-    elif "unfair" in raw:
-        p_type = "unfair_practice"
-    else:
-        p_type = "unknown"
-
-    return {
-        "type": p_type,
-        "raw_text": raw
-    }
 
 
 # -----------------------------
 # MAIN
 # -----------------------------
 def main():
-    df = pd.read_csv(INPUT_PATH)
+    # try utf-8 first, fallback if needed
+    try:
+        df = pd.read_csv(INPUT_PATH, encoding="utf-8")
+    except:
+        df = pd.read_csv(INPUT_PATH, encoding="latin1")
+
+    # normalize column names
+    df.columns = df.columns.str.strip()
+
+    print("COLUMNS:", df.columns.tolist())
 
     state_laws = {}
 
     for _, row in df.iterrows():
         state = str(row["State"]).strip().lower().replace(" ", "_")
 
+        ag_type = str(row["AG_type"]).strip().lower()
+
         state_laws[state] = {
-            "pii_bucket": pii_bucket(row["PII(types)"]),
-            "timeline": parse_timeline(row["timeline_days(individual)"]),
-            "ag": parse_ag(row["Notification to AG"]),
-            "penalty": parse_penalty(row["$ Penalty"])
+            "timeline": clean_timeline(row["timeline_days(individual)"]),
+            "ag": {
+                "type": ag_type if ag_type in ["none", "conditional", "mandatory"] else "none",
+                "threshold": clean_int(row["AG_threshold"]),
+                "deadline_days": clean_int(row["AG_days"])
+            },
+            "meta": {
+                "pii_definition": clean_text(row["Definition_of _PII"]),
+                "ag_text": clean_text(row["Notification to AG"]),
+                "penalty_text": clean_text(row["Penalty"])
+            }
         }
 
-    with open(OUTPUT_PATH, "w") as f:
-        json.dump(state_laws, f, indent=2)
+        # debug one state
+        if state == "alabama":
+            print("DEBUG ALABAMA:", state_laws[state])
 
-    print(f"Saved structured data to {OUTPUT_PATH}")
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+        json.dump(state_laws, f, indent=2, ensure_ascii=False)
+
+    print(f"Saved cleaned JSON to {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
