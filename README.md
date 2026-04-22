@@ -6,16 +6,6 @@ Takes incident input → outputs per-state obligations + aggregated deadlines.
 
 ---
 
-## 📂 Structure
-50states/
-├── main.py
-├── engine/
-│ └── rules.py
-├── data/
-│ └── processed/
-│ └── state_laws.json
-
-
 ### File Roles
 - **main.py** → Runs the engine on a sample incident and prints results  
 - **engine/rules.py** → Core logic (PII check, timeline, AG rules, aggregation)  
